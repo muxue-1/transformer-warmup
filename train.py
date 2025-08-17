@@ -59,26 +59,29 @@ class TransformerTrainer:
 
         # Build LR scheduler with warmup + decay per step
         total_steps = max(1, (len(train_loader) * num_epochs))
-        warmup_steps = int(getattr(self.config, 'warmup_ratio', 0.0) * total_steps)
-        min_lr_ratio = float(getattr(self.config, 'min_lr_ratio', 0.0))
+        # Enforce monotonic decrease: start at peak_lr and decay to min_lr without warmup ramp
         scheduler_type = getattr(self.config, 'scheduler_type', 'cosine')
+        peak_lr = float(getattr(self.config, 'peak_lr', learning_rate))
+        min_lr = float(getattr(self.config, 'min_lr', learning_rate))
+        base_lr = learning_rate
 
         def lr_lambda(current_step: int) -> float:
-            if current_step < warmup_steps and warmup_steps > 0:
-                return float(current_step) / float(max(1, warmup_steps))
-            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            progress = float(current_step) / float(max(1, total_steps))
             progress = min(max(progress, 0.0), 1.0)
+            factor_peak = (peak_lr / base_lr)
+            factor_min = (min_lr / base_lr)
             if scheduler_type == 'linear':
-                return (1.0 - progress) * (1.0 - min_lr_ratio) + min_lr_ratio
-            else:  # cosine
+                return factor_peak - (factor_peak - factor_min) * progress
+            else:  # cosine, monotonically decreasing from peak to min
                 import math
-                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-                return cosine_decay * (1.0 - min_lr_ratio) + min_lr_ratio
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return factor_min + cosine * (factor_peak - factor_min)
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        # Use -100 as ignore_index because labels are masked to -100 for non-answer positions
         criterion = nn.CrossEntropyLoss(
             label_smoothing=getattr(self.config, 'label_smoothing', 0.0),
-            ignore_index=config.pad_token_id,
+            ignore_index=-100,
         )
 
         self.model.to(device)
@@ -97,9 +100,9 @@ class TransformerTrainer:
                 optimizer.zero_grad()
                 output = self.model(input_ids)
                 loss = criterion(output.view(-1, config.vocab_size), target_ids.view(-1))
-                # Train accuracy (ignore pad)
+                # Train accuracy: only count answer tokens (labels != -100)
                 preds_train = output.argmax(dim=-1)
-                mask_train = target_ids.ne(config.pad_token_id)
+                mask_train = target_ids.ne(-100)
                 correct_tokens_train += (preds_train.eq(target_ids) & mask_train).sum().item()
                 total_tokens_train += mask_train.sum().item()
                 # Retain grad on loss to inspect d(loss)/d(loss) (typically 1.0 after backward)
@@ -203,7 +206,7 @@ class TransformerTrainer:
                         total_loss += loss.item()
                         # accuracy（忽略 pad）
                         preds = output.argmax(dim=-1)
-                        mask = target_ids.ne(config.pad_token_id)
+                        mask = target_ids.ne(-100)
                         correct_tokens += (preds.eq(target_ids) & mask).sum().item()
                         total_tokens += mask.sum().item()
                         acc = correct_tokens / max(1, total_tokens)
@@ -224,7 +227,7 @@ class TransformerTrainer:
         test_ds = EquationDataset(self.test_dataset, self.config)
         test_loader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=True)
 
-        criterion = nn.CrossEntropyLoss(ignore_index=config.pad_token_id)
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.model.eval()
         with torch.no_grad():
             total_loss = 0.0
@@ -239,7 +242,7 @@ class TransformerTrainer:
                 loss = criterion(output.view(-1, config.vocab_size), target_ids.view(-1))
                 total_loss += loss.item()
                 preds = output.argmax(dim=-1)
-                mask = target_ids.ne(config.pad_token_id)
+                mask = target_ids.ne(-100)
                 correct_tokens += (preds.eq(target_ids) & mask).sum().item()
                 total_tokens += mask.sum().item()
                 acc = correct_tokens / max(1, total_tokens)

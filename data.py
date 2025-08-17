@@ -98,12 +98,36 @@ class EquationDataset(torch.utils.data.Dataset):
         input_ids = ids[:-1]
         target_ids = ids[1:]
 
+        # Only train on answer tokens after '='; others are ignored with -100
+        # Find position of '=' in the truncated ids
+        eq_token_id = self.tokenizer.config.tokens['=']
+        eq_index = -1
+        for i, t in enumerate(ids):
+            if t == eq_token_id:
+                eq_index = i
+                break
+
+        # Modify targets: keep only digits after '=' and before <eop>, else -100
+        modified_targets = []
+        for pos, tok in enumerate(target_ids):
+            # target at pos corresponds to ids[pos + 1]
+            is_after_equal = (eq_index != -1) and ((pos + 1) > eq_index)
+            is_digit = 0 <= tok <= 9  # digits '0'..'9' are 0..9 in vocab
+            is_eop = tok == self.tokenizer.eop_token_id
+            if is_after_equal and is_digit:
+                modified_targets.append(tok)
+            else:
+                # ignore prediction (including inputs before '=', '=', non-digits, and <eop>)
+                modified_targets.append(-100)
+        target_ids = modified_targets
+
         # Pad to fixed length
         pad_id = self.tokenizer.pad_token_id
         if len(input_ids) < self.fixed_length:
             pad_amount = self.fixed_length - len(input_ids)
             input_ids = input_ids + [pad_id] * pad_amount
-            target_ids = target_ids + [pad_id] * pad_amount
+            # ignore padded labels as well
+            target_ids = target_ids + [-100] * pad_amount
         else:
             # Ensure exact length
             input_ids = input_ids[: self.fixed_length]
